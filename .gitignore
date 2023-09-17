@@ -85,3 +85,10 @@ target/
 lib/pycocotools/_mask.c
 lib/nms/cpu_nms.c
 
+
+gligen_checkpoints/
+*.sh
+*.json
+.gitignore
+*.txt
+.gitignore

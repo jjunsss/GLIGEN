@@ -14,10 +14,12 @@ import numpy as np
 import clip 
 from scipy.io import loadmat
 from functools import partial
+import dist as utils
 import torchvision.transforms.functional as F
 import torchvision.transforms.functional as TF
 import torchvision.transforms as transforms
 
+import json
 device = "cuda"
 
 
@@ -80,7 +82,7 @@ def load_ckpt(ckpt_path):
     # donot need to load official_ckpt for self.model here, since we will load from our ckpt
     model.load_state_dict( saved_ckpt['model'] )
     autoencoder.load_state_dict( saved_ckpt["autoencoder"]  )
-    text_encoder.load_state_dict( saved_ckpt["text_encoder"]  )
+    text_encoder.load_state_dict( saved_ckpt["text_encoder"], strict=False )
     diffusion.load_state_dict( saved_ckpt["diffusion"]  )
 
     return model, autoencoder, text_encoder, diffusion, config
@@ -337,7 +339,12 @@ def prepare_batch_sem(meta, batch=1):
     }
     return batch_to_device(out, device) 
 
+def check_overlap(box1, box2):
+    x1_1, y1_1, x2_1, y2_1 = box1
+    x1_2, y1_2, x2_2, y2_2 = box2
 
+    # 겹치는 조건을 확인
+    return x1_1 < x2_2 and x2_1 > x1_2 and y1_1 < y2_2 and y2_1 > y1_2
 
 @torch.no_grad()
 def run(meta, config, starting_noise=None):
@@ -416,13 +423,11 @@ def run(meta, config, starting_noise=None):
     input = dict(
                 x = starting_noise, 
                 timesteps = None, 
-                context = context, 
-                grounding_input = grounding_input,
+                context = context, #prompt
+                grounding_input = grounding_input, #given additional input
                 inpainting_extra_input = inpainting_extra_input,
                 grounding_extra_input = grounding_extra_input,
-
             )
-
 
     # - - - - - start sampling - - - - - #
     shape = (config.batch_size, model.in_channels, model.image_size, model.image_size)
@@ -438,37 +443,130 @@ def run(meta, config, starting_noise=None):
     start = len( os.listdir(output_folder) )
     image_ids = list(range(start,start+config.batch_size))
     print(image_ids)
-    for image_id, sample in zip(image_ids, samples_fake):
-        img_name = str(int(image_id))+'.png'
+    
+    bbox = grounding_input["boxes"]
+    padding_value = torch.zeros(4).cuda()
+    colors = ['red', 'blue', 'green', 'yellow', 'purple', 'orange']
+
+    for idx, (image_id, sample) in enumerate(zip(image_ids, samples_fake)):
+        img_name = str(meta["image_id"])+".jpg"
+        # img_name = str(int(image_id))+'.png'
         sample = torch.clamp(sample, min=-1, max=1) * 0.5 + 0.5
         sample = sample.cpu().numpy().transpose(1,2,0) * 255 
         sample = Image.fromarray(sample.astype(np.uint8))
+        draw = ImageDraw.Draw(sample)
+
+        # # bbox를 이미지에 추가
+        # for j in range(bbox.shape[1]):
+        #     # padding이 아닌 bbox만 시각화
+        #     color = colors[j % len(colors)]
+        #     if not torch.equal(bbox[idx][j], padding_value):
+        #         x1, y1, x2, y2 = (bbox[idx][j].cpu() * sample.size[0]).to(dtype=torch.int32)
+        #         draw.rectangle([x1, y1, x2, y2], outline =color)
+                
         sample.save(  os.path.join(output_folder, img_name)   )
+        
+from copy import deepcopy
+from pycocotools.coco import COCO
+import os
+import cv2
+from PIL import Image
+from transformers import AutoProcessor, Blip2ForConditionalGeneration
+from coco_annotations import coco_loader, filter_annotations_and_images, make_meta_dict
+from tqdm import tqdm
+import torch.distributed as dist
 
 
 
+def custom_dataset(sample, max_length, blip_model, blip_processor):
+    coco_json_path = '/home/user/sumin/paper/COCODIR/annotations/instances_train2017.json' 
+        
+    coco = COCO(coco_json_path)
+    new_train_json = coco_loader(coco_json_path)
+    new_train_json = filter_annotations_and_images(new_train_json, )
+    image_length = len(new_train_json["images"])
+    
+    #ddp divided
+    rank = utils.get_rank()
+    world_size = utils.get_world_size()
+    per_image_length = image_length / world_size
+    start_idx = rank * int(per_image_length)
+    end_idx = start_idx + per_image_length if rank != world_size - 1 else image_length
+    start_idx = int(start_idx)
+    end_idx = int(end_idx)
+    my_slice = new_train_json["images"][start_idx:end_idx]
 
+    meta_list = []
+    filtered_images = []
+    filtered_annotations = []
+
+    image_bar = tqdm(total=len(my_slice), desc="Processing annotations", disable=not utils.is_main_process())
+    for image_info in my_slice:
+        image_bar.update(1)
+        temp_gligen_dict = make_meta_dict(coco, sample, image_info, max_length, blip_processor, blip_model)
+        
+        if temp_gligen_dict is None:    
+            # Remove this image_info and continue
+            continue
+        else:
+            image_info["prompt"] = temp_gligen_dict["prompt"]
+            filtered_images.append(image_info)
+            # Assuming that you have an image id field in your image_info
+            image_id = image_info['id']
+            corresponding_annotations = [anno for anno in new_train_json["annotations"] if anno['image_id'] == image_id]
+            filtered_annotations.extend(corresponding_annotations)
+            meta_list.append(temp_gligen_dict)
+            
+            break
+
+    # save distrivuted meta and json information
+    dist.barrier() #sync
+    new_train_json["images"] = filtered_images  
+    new_train_json["annotations"] = filtered_annotations
+    
+    save_path = "/data/gen_dataset/annotations"
+    utils.save_each_file(save_path, "train", new_train_json)
+    utils.save_each_file(save_path, "meta", meta_list)
+    dist.barrier() #sync
+    
+    # load each meta and json for integration
+    # if utils.is_main_process():
+    #     json_file = load_file()
+    #     meta_file = load_file()
+        
+    # # save total json and meta information
+    # save_each_file(save_path, "train", new_train_json)
+    # save_each_file(save_path, "meta", meta_list)
+    # if utils.is_main_process() :    
+    #     with open(save_json, 'w') as f:  # Use 'w' to overwrite the file
+    #         json_str = json.dumps(new_train_json)
+    #         f.write(json_str)
+            
+    #     with open(save_meta, 'w') as f:  # Use 'w' to overwrite the file
+    #         json_str = json.dumps(meta_list)
+    #         f.write(json_str)
+        
+    return meta_list
+    
 if __name__ == "__main__":
     
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--folder", type=str,  default="generation_samples", help="root folder for output")
-
-
-    parser.add_argument("--batch_size", type=int, default=5, help="")
+    parser.add_argument("--batch_size", type=int, default=1, help="")
     parser.add_argument("--no_plms", action='store_true', help="use DDIM instead. WARNING: I did not test the code yet")
     parser.add_argument("--guidance_scale", type=float,  default=7.5, help="")
-    parser.add_argument("--negative_prompt", type=str,  default='longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality', help="")
-    #parser.add_argument("--negative_prompt", type=str,  default=None, help="")
+    # parser.add_argument("--negative_prompt", type=str,  default='longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality', help="")
+    parser.add_argument("--negative_prompt", type=str,  default="blurry, overlapping objects, distorted proportions, obscured faces, low visibility, unnatural colors, longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality", help="")
+    parser.add_argument("--max_length", type=int, default=5, help="")
     args = parser.parse_args()
     
-
+    utils.init_distributed_mode(args)
 
     meta_list = [ 
-
         # - - - - - - - - GLIGEN on text grounding for generation - - - - - - - - # 
         dict(
-            ckpt = "../gligen_checkpoints/checkpoint_generation_text.pth",
+            ckpt = "./gligen_checkpoints/checkpoint_generation_text.pth",
             prompt = "a teddy bear sitting next to a bird",
             phrases = ['a teddy bear', 'a bird'],
             locations = [ [0.0,0.09,0.33,0.76], [0.55,0.11,1.0,0.8] ],
@@ -476,173 +574,42 @@ if __name__ == "__main__":
             save_folder_name="generation_box_text"
         ), 
 
-
-        # - - - - - - - - GLIGEN on text grounding for inpainting - - - - - - - - # 
-        dict(
-            ckpt = "../gligen_checkpoints/checkpoint_inpainting_text.pth",
-            input_image = "inference_images/dalle2_museum.jpg",
-            prompt = "a corgi and a cake",
-            phrases =   ['corgi', 'cake'],
-            locations = [ [0.25, 0.28, 0.42, 0.52], [0.14, 0.58, 0.58, 0.92], ], # mask will be derived from box 
-            save_folder_name="inpainting_box_text"
-        ),
-
-
-        # - - - - - - - - GLIGEN on image grounding for generation - - - - - - - - # 
-        dict(
-            ckpt = "../gligen_checkpoints/checkpoint_generation_text_image.pth",
-            prompt = "an alarm clock sitting on the beach",
-            images = ['inference_images/clock.png'],
-            phrases = ['alarm clock'],
-            locations = [ [0.0,0.09,0.53,0.76] ],
-            alpha_type = [1.0, 0.0, 0.0],
-            save_folder_name="generation_box_image"
-        ),
-
-
-
-        # - - - - - - - - GLIGEN on text and style grounding for generation - - - - - - - - # 
-        dict(
-            ckpt = "../gligen_checkpoints/checkpoint_generation_text_image.pth",
-            prompt = "a brick house in the woods, anime, oil painting",
-            phrases =   ['a brick house',            'placehoder'],
-            images =    ['inference_images/placeholder.png', 'inference_images/style_golden.jpg'],
-            locations = [ [0.4,0.2,1.0,0.8],         [0.0, 1.0, 0.0, 1.0] ],
-            alpha_type = [1, 0, 0],  
-            text_mask = [1,0],  # the second text feature will be masked 
-            image_mask =[0,1],  # the first image feature will be masked
-            save_folder_name="generation_box_text_style"
-        ), 
-
-
-        # - - - - - - - - GLIGEN on image grounding for inpainting - - - - - - - - # 
-        dict(
-            ckpt = "../gligen_checkpoints/checkpoint_inpainting_text_image.pth",
-            input_image = "inference_images/beach.jpg",
-            prompt = "a bigben on the beach",
-            images = [ 'inference_images/bigben.jpg'],
-            locations = [ [0.18, 0.08, 0.62, 0.75] ], # mask will be derived from box 
-            save_folder_name="inpainting_box_image"
-        ),
-
-
-
-        # - - - - - - - - GLIGEN on hed grounding for generation - - - - - - - - # 
-        dict(
-            ckpt ="../gligen_checkpoints/checkpoint_generation_hed.pth",
-            prompt = "a man is eating breakfast",  
-            hed_image = 'inference_images/hed_man_eat.png',
-            save_folder_name="hed",
-            alpha_type = [0.9, 0, 0.1], 
-        ),
-
-
-
-
-        # - - - - - - - - GLIGEN on canny grounding for generation - - - - - - - - # 
-        dict(
-            ckpt ="../gligen_checkpoints/checkpoint_generation_canny.pth",
-            prompt = "A Humanoid Robot Designed for Companionship", 
-            canny_image = 'inference_images/canny_robot.png',
-            alpha_type = [0.9, 0, 0.1], 
-            save_folder_name="canny"
-        ),
-
-
-
-
-        # - - - - - - - - GLIGEN on normal grounding for generation - - - - - - - - # 
-        dict(
-            ckpt ="../gligen_checkpoints/checkpoint_generation_normal.pth",
-            prompt = "a large tree with no leaves in front of a building", # 
-            normal = 'inference_images/normal_tree_building.jpg', # a normal map 
-            alpha_type = [0.7, 0, 0.3], 
-            save_folder_name="normal",
-        ),
-
-
-        # - - - - - - - - GLIGEN on depth grounding for generation - - - - - - - - # 
-        dict(
-            ckpt ="../gligen_checkpoints/checkpoint_generation_depth.pth",
-            prompt = "a Vibrant colorful Bird Sitting on Tree Branch", # 
-            depth = 'inference_images/depth_bird.png', 
-            alpha_type = [0.7, 0, 0.3], 
-            save_folder_name="depth"
-        ),
-
-
-        # - - - - - - - - GLIGEN on sem grounding for generation - - - - - - - - # 
-        dict(
-            ckpt ="../gligen_checkpoints/checkpoint_generation_sem.pth",
-            prompt = "a living room filled with lots of furniture and plants", # 
-            sem = 'inference_images/sem_ade_living_room.png', # ADE raw annotation  
-            alpha_type = [0.7, 0, 0.3], 
-            save_folder_name="sem"
-        ),
-
-
-
-        # - - - - - - - - GLIGEN on keypoint grounding for generation - - - - - - - - # 
-        dict(
-            ckpt = "../gligen_checkpoints/checkpoint_generation_keypoint.pth",
-            prompt = "A young man and a small boy are talking",
-            locations = [  
-                            [
-                                [0.7598, 0.2542],
-                                [0.7431, 0.2104],
-                                [0.8118, 0.2021],
-                                [0.0000, 0.0000],
-                                [0.9514, 0.1813],
-                                [0.7806, 0.2917],
-                                [0.0000, 0.0000],
-                                [0.6785, 0.5125],
-                                [0.0000, 0.0000],
-                                [0.5389, 0.6479],
-                                [0.6785, 0.6750],
-                                [0.7973, 0.7042],
-                                [0.0000, 0.0000],
-                                [0.6181, 0.7375],
-                                [0.9764, 0.8458],
-                                [0.0000, 0.0000],
-                                [0.0000, 0.0000]
-                            ], 
-
-                            [
-                                [0.2681, 0.4313],
-                                [0.2514, 0.3979],
-                                [0.0000, 0.0000],
-                                [0.0785, 0.3854],
-                                [0.0000, 0.0000],
-                                [0.0910, 0.5583],
-                                [0.0000, 0.0000],
-                                [0.1243, 0.8479],
-                                [0.0000, 0.0000],
-                                [0.0000, 0.0000],
-                                [0.0000, 0.0000],
-                                [0.0000, 0.0000],
-                                [0.0000, 0.0000],
-                                [0.2410, 0.8146],
-                                [0.1202, 0.6146],
-                                [0.0000, 0.0000],
-                                [0.2743, 0.7188]
-                            ], 
-
-             ],  # from id=18150 val set in coco2017k
-            alpha_type = [0.3, 0.0, 0.7],
-            save_folder_name="keypoint"
-        ),
-
-
-
     ]
+    
+    # blip-2 for generating prompt
+    processor = AutoProcessor.from_pretrained("Salesforce/blip2-opt-2.7b")
+    model = Blip2ForConditionalGeneration.from_pretrained("Salesforce/blip2-opt-2.7b", torch_dtype=torch.float16)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    
+    world_size = utils.get_world_size()
+    rank = utils.get_rank()
 
-
+    # if isinstance(pick_the_ids, int) :
+    #     new_meta_list.append(custom_dataset(meta_list[0], pick_the_ids, 5, model, processor))
+    # else:
+    #     for idx in pick_the_ids:
+    #         new_meta_list.append(custom_dataset(meta_list[0], idx, 5, model, processor))
+    new_meta_list = custom_dataset(meta_list[0], args.max_length, model, processor)
+    # new_meta_list = loading_dataset(meta_list[0], args.max_length, model, processor)
+    # list refiner
+    new_meta_list = [data for data in new_meta_list if data is not None]
     starting_noise = torch.randn(args.batch_size, 4, 64, 64).to(device)
     starting_noise = None
-    for meta in meta_list:
-        run(meta, args, starting_noise)
+    torch.cuda.empty_cache()
 
+    total_size = len(new_meta_list)
+    per_process_size = total_size // world_size
     
+    start_idx = rank * per_process_size
+    end_idx = start_idx + per_process_size if rank != world_size - 1 else total_size
+    start_idx = int(start_idx)
+    end_idx = int(end_idx)
+    my_slice = new_meta_list[start_idx:end_idx]
 
+    # Now each process will only process its own slice
+    for meta in my_slice:
+        run(meta, args, starting_noise)
+        
 
-
+    utils.cleanup()
